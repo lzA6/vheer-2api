@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vheer-2API 测试面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Vheer-2API 测试面板</h1>
+        <div class="api-key-container">
+            <label for="api-key">API Key:</label>
+            <input type="password" id="api-key" value="1">
+        </div>
+
+        <div class="tabs">
+            <button class="tab-link active" onclick="openTab(event, 't2i')">文生图</button>
+            <button class="tab-link" onclick="openTab(event, 'i2i')">图生图</button>
+            <button class="tab-link" onclick="openTab(event, 'i2v')">图生视频</button>
+        </div>
+
+        <!-- 文生图 Tab -->
+        <div id="t2i" class="tab-content active">
+            <h2>文生图 (Text-to-Image)</h2>
+            <form id="t2i-form">
+                <div class="form-group">
+                    <label for="t2i-prompt">提示词 (Prompt)</label>
+                    <textarea id="t2i-prompt" required placeholder="例如：一只穿着宇航服的猫在月球上"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="t2i-model">模型 (Model)</label>
+                    <select id="t2i-model">
+                        <option value="vheer-text-to-image-pro" selected>Pro Model</option>
+                        <option value="vheer-text-to-image-max">Max Model</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="t2i-size">比例 (Aspect Ratio)</label>
+                    <select id="t2i-size">
+                        <option value="1:1" selected>1:1 (方形)</option>
+                        <option value="1:2">1:2</option>
+                        <option value="2:1">2:1</option>
+                        <option value="2:3">2:3</option>
+                        <option value="3:2">3:2</option>
+                        <option value="3:4">3:4</option>
+                        <option value="4:3">4:3</option>
+                        <option value="4:5">4:5</option>
+                        <option value="5:4">5:4</option>
+                        <option value="9:16">9:16 (竖屏)</option>
+                        <option value="16:9">16:9 (横屏)</option>
+                    </select>
+                </div>
+                <button type="submit">生成图像</button>
+            </form>
+        </div>
+
+        <!-- 图生图 Tab -->
+        <div id="i2i" class="tab-content">
+            <h2>图生图 (Image-to-Image)</h2>
+            <form id="i2i-form">
+                <div class="form-group">
+                    <label for="i2i-image">上传图片</label>
+                    <input type="file" id="i2i-image" accept="image/*" required>
+                </div>
+                <div class="form-group">
+                    <label for="i2i-prompt">提示词 (Prompt)</label>
+                    <textarea id="i2i-prompt" required placeholder="描述你希望如何修改图片"></textarea>
+                </div>
+                <div class="form-group slider-group">
+                    <label for="creative-strength">创意实力 (Creative Strength): <span id="creative-value">10</span></label>
+                    <input type="range" id="creative-strength" min="1" max="10" value="10">
+                </div>
+                <div class="form-group slider-group">
+                    <label for="control-strength">控制强度 (Control Strength): <span id="control-value">2</span></label>
+                    <input type="range" id="control-strength" min="1" max="10" value="2">
+                </div>
+                <button type="submit">生成图像</button>
+            </form>
+        </div>
+
+        <!-- 图生视频 Tab -->
+        <div id="i2v" class="tab-content">
+            <h2>图生视频 (Image-to-Video)</h2>
+            <form id="i2v-form">
+                <div class="form-group">
+                    <label for="i2v-image">上传图片</label>
+                    <input type="file" id="i2v-image" accept="image/*" required>
+                </div>
+                <button type="submit">生成视频</button>
+            </form>
+        </div>
+
+        <div id="result-container" class="hidden">
+            <h3>生成结果</h3>
+            <div id="spinner" class="spinner hidden"></div>
+            <div id="result-output"></div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>

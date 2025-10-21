@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+loguru
+playwright
+python-multipart
+aiofiles
