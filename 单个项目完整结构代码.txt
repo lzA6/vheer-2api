@@ -1,0 +1,983 @@
+项目 'vheer-2api' 的结构树:
+📂 vheer-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 vheer_provider.py
+        📂 utils/
+            📄 sse_utils.py
+    📂 static/
+        📄 index.html
+        📄 script.js
+        📄 style.css
+================================================================================
+
+--- 文件路径: .env ---
+
+# [自动填充] vheer-2api 生产环境配置
+# 该文件由 Genesis Protocol v8.0 自动生成，可直接用于一键部署。
+
+# --- 核心安全配置 ---
+# 用于保护您的 API 服务的访问密钥，请按需修改为您自己的复杂密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- Vheer.com 凭证 (已从您提供的抓包数据中自动提取) ---
+# 如果服务失效，请登录 vheer.com 后，按 F12 打开开发者工具，在网络(Network)面板找到任意请求，
+# 从其请求头(Request Headers)中复制完整的 "cookie" 字符串并更新此值。
+VHEER_COOKIE="gppChoices=DBABRg~BFoAABA; _gid=GA1.2.1285030137.1761025494; g_state={\"i_l\":0,\"i_ll\":1761025493758}; Authorization=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTE3OTY5LCJ1c2VybmFtZSI6InExMzY0NTk0NzQwN0BnbWFpbC5jb20iLCJwYXNzd29yZCI6IjVBNEY0RUE2M0Q1OEE1RjcyRUI5MEMwNzk0QTZDMTc2IiwiaWF0IjoxNzYxMDI3NTM3fQ.wfrVcCFJtSdT-V-qRSMW-MAhrx1rLNUCRExF51AR4A0; _ga=GA1.2.1565573183.1760505910; _ga_CD46LH948W=GS2.1.s1761027536$o4$g1$t1761029666$j58$l0$h0"
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# vheer-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的凭证。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-vheer-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- Vheer.com 凭证 (必须设置) ---
+# 请登录 vheer.com，然后按 F12 打开开发者工具，在网络(Network)面板找到任意一个发往 vheer.com 或 access.vheer.com 的请求，
+# 从其请求头(Request Headers)中复制完整的 "cookie" 字符串并粘贴于此。
+# 示例: VHEER_COOKIE="gppChoices=...; _gid=...; Authorization=eyJhbGciOi...; ..."
+VHEER_COOKIE=""
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for vheer-2api (v1.0 - Playwright Edition)
+# ====================================================================
+
+FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: vheer-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - vheer-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vheer-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    # 增加共享内存大小，这对于 Playwright/Chromium 的稳定运行至关重要
+    shm_size: '2gb'
+    networks:
+      - vheer-net
+
+networks:
+  vheer-net:
+    driver: bridge
+
+--- 文件路径: main.py ---
+
+import sys
+import json
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header, File, UploadFile, Form
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.vheer_provider import VheerProvider, BrowserManager
+
+# --- 日志配置 ---
+logger.remove()
+# --- FIX: 将日志级别调整为 TRACE 以输出最详细的步骤信息 ---
+logger.add(
+    sys.stdout,
+    level="TRACE",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    colorize=True
+)
+
+# --- 全局实例 ---
+browser_manager = BrowserManager()
+provider = VheerProvider(browser_manager)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    await browser_manager.start_browser()
+    logger.info("服务已进入 'Headless-Browser-Proxy-Execution' 模式。")
+    logger.info(f"API 服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    logger.info(f"Web UI 测试界面已启用，请访问 http://localhost:{settings.NGINX_PORT}/")
+    yield
+    await browser_manager.close_browser()
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+@app.post("/v1/images/generations", dependencies=[Depends(verify_api_key)])
+async def text_to_image(request: Request):
+    try:
+        request_data = await request.json()
+        # --- ADD: 增加详细的请求载荷日志 ---
+        logger.debug(f"收到 /v1/images/generations 请求，载荷: \n{json.dumps(request_data, ensure_ascii=False, indent=2)}")
+        response = await provider.generate_from_text(request_data)
+        # --- ADD: 增加详细的响应日志 ---
+        if isinstance(response, JSONResponse):
+             logger.debug(f"准备返回响应，内容: \n{json.dumps(response.body.decode('utf-8'), ensure_ascii=False, indent=2)}")
+        return response
+    except Exception as e:
+        logger.error(f"处理文生图请求时出错: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {e}")
+
+@app.post("/v1/images/edits", dependencies=[Depends(verify_api_key)])
+async def image_to_image(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: str = Form("vheer-image-to-image"),
+    creative_strength: int = Form(10),
+    control_strength: int = Form(2)
+):
+    try:
+        # --- ADD: 增加详细的请求载荷日志 ---
+        logger.debug(f"收到 /v1/images/edits 请求: prompt='{prompt}', model='{model}', creative_strength={creative_strength}, control_strength={control_strength}, image='{image.filename}'")
+        image_bytes = await image.read()
+        response = await provider.generate_from_image(
+            prompt=prompt,
+            image_bytes=image_bytes,
+            creative_strength=creative_strength,
+            control_strength=control_strength
+        )
+        if isinstance(response, JSONResponse):
+             logger.debug(f"准备返回响应，内容: \n{json.dumps(response.body.decode('utf-8'), ensure_ascii=False, indent=2)}")
+        return response
+    except Exception as e:
+        logger.error(f"处理图生图请求时出错: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {e}")
+
+@app.post("/v1/video/generations", dependencies=[Depends(verify_api_key)])
+async def image_to_video(
+    image: UploadFile = File(...)
+):
+    try:
+        # --- ADD: 增加详细的请求载荷日志 ---
+        logger.debug(f"收到 /v1/video/generations 请求: image='{image.filename}'")
+        image_bytes = await image.read()
+        response = await provider.generate_video_from_image(image_bytes=image_bytes)
+        if isinstance(response, JSONResponse):
+             logger.debug(f"准备返回响应，内容: \n{json.dumps(response.body.decode('utf-8'), ensure_ascii=False, indent=2)}")
+        return response
+    except Exception as e:
+        logger.error(f"处理图生视频请求时出错: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {e}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_ui():
+    try:
+        with open("static/index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="UI 文件 (static/index.html) 未找到。")
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # 增加 proxy 超时时间，以应对可能较长的图像/视频生成时间
+    proxy_connect_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+
+    upstream vheer_backend {
+        # ip_hash 确保来自同一客户端的请求被转发到同一个 worker
+        # 这对于保持会话上下文的连续性至关重要
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        # 允许上传更大的文件
+        client_max_body_size 100M;
+
+        location / {
+            proxy_pass http://vheer_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+loguru
+playwright
+python-multipart
+aiofiles
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+import uuid
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
+from typing import Optional, List, Dict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "vheer-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 vheer.com 的文生图、图生图、图生视频功能转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = "1"
+    NGINX_PORT: int = 8088
+    VHEER_COOKIE: Optional[str] = None
+
+    API_REQUEST_TIMEOUT: int = 300 # 秒
+
+    MODEL_MAPPING: Dict[str, str] = {
+        "vheer-text-to-image-pro": "Pro Model",
+        "vheer-text-to-image-max": "Max Model",
+        "vheer-image-to-image": "Image-to-Image",
+        "vheer-image-to-video": "Image-to-Video"
+    }
+
+    @model_validator(mode='after')
+    def validate_settings(self) -> 'Settings':
+        if not self.VHEER_COOKIE:
+            raise ValueError("VHEER_COOKIE 必须在 .env 文件中设置。")
+        return self
+
+settings = Settings()
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\vheer_provider.py ---
+
+import asyncio
+import time
+import json
+from typing import Dict, Any, Optional
+from pathlib import Path
+import tempfile
+
+from loguru import logger
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
+
+from app.core.config import settings
+
+class BrowserManager:
+    """管理 Playwright 浏览器实例和并发锁。"""
+    def __init__(self):
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.lock = asyncio.Lock()
+
+    async def start_browser(self):
+        logger.info("正在启动 Playwright 浏览器...")
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=True)
+        
+        cookies = []
+        if settings.VHEER_COOKIE:
+            cookie_parts = settings.VHEER_COOKIE.split(';')
+            for part in cookie_parts:
+                if '=' in part:
+                    name, value = part.strip().split('=', 1)
+                    cookies.append({"name": name, "value": value, "domain": ".vheer.com", "path": "/"})
+        
+        self.context = await self.browser.new_context()
+        if cookies:
+            await self.context.add_cookies(cookies)
+            logger.success("浏览器启动并已设置 Cookie。")
+        else:
+            logger.warning("VHEER_COOKIE 未设置，浏览器未加载任何 Cookie。")
+
+    async def new_page(self) -> Page:
+        if not self.context:
+            raise RuntimeError("浏览器上下文未初始化。")
+        return await self.context.new_page()
+
+    async def close_browser(self):
+        if self.context:
+            await self.context.close()
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+        logger.info("浏览器已关闭。")
+
+
+class VheerProvider:
+    def __init__(self, browser_manager: BrowserManager):
+        self.browser_manager = browser_manager
+
+    async def _execute_in_browser(self, task_coro):
+        """带锁执行浏览器任务的通用包装器。"""
+        async with self.browser_manager.lock:
+            page = None
+            try:
+                result = await asyncio.wait_for(task_coro(), timeout=settings.API_REQUEST_TIMEOUT + 120)
+                return result
+            except asyncio.TimeoutError:
+                logger.error(f"浏览器任务因总超时而失败（超过 {settings.API_REQUEST_TIMEOUT + 120} 秒）。")
+                raise HTTPException(status_code=504, detail="上游服务响应超时。")
+            except PlaywrightTimeoutError as e:
+                logger.error(f"Playwright 操作超时: {e}", exc_info=True)
+                raise HTTPException(status_code=502, detail=f"与上游服务交互超时: {e}")
+            except Exception as e:
+                logger.error(f"浏览器任务执行时发生未知错误: {e}", exc_info=True)
+                raise HTTPException(status_code=502, detail=f"与上游服务交互时出错: {e}")
+
+    async def _create_page_with_logging(self) -> Page:
+        """创建一个新页面并附加详细的网络日志记录器。"""
+        page = await self.browser_manager.new_page()
+        logger.debug("--- [网络日志记录器已激活] ---")
+        
+        async def log_request(request):
+            if "data:image" not in request.url and "google" not in request.url and "ezoic" not in request.url and "quantserve" not in request.url:
+                post_data = request.post_data or "N/A"
+                logger.trace(f"==> [请求] {request.method} {request.url} | 载荷: {post_data[:300]}")
+
+        async def log_response(response):
+            if "data:image" not in response.url and "google" not in response.url and "ezoic" not in response.url and "quantserve" not in response.url:
+                status = response.status
+                try:
+                    body = await response.text()
+                    log_body = body[:500].strip() + "..." if len(body) > 500 else body.strip()
+                except Exception:
+                    log_body = "[二进制或无法解析的响应体]"
+                logger.trace(f"<== [响应] {status} {response.url} | 响应体: {log_body}")
+
+        page.on("request", lambda req: asyncio.create_task(log_request(req)))
+        page.on("response", lambda res: asyncio.create_task(log_response(res)))
+        return page
+
+    async def _wait_for_result_url(self, page: Page, target_url_prefix: str, media_suffix: tuple) -> str:
+        """
+        最终决战方案：通过监听网络响应来获取结果URL。
+        这个方法结合了两种策略：
+        1. 主要策略：监听发往 vheer.com/app/... 的 POST 请求响应，解析其中的 JSON 数据，寻找成功状态和下载链接。
+        2. 后备策略：监听对最终媒体文件（.jpg, .mp4）的直接请求。
+        """
+        result_future = asyncio.Future()
+        
+        async def handle_response(response):
+            # 主要策略：捕获包含成功状态的JSON响应
+            if response.url.startswith(target_url_prefix) and response.request.method == "POST":
+                try:
+                    text = await response.text()
+                    # 响应可能是多行，我们需要找到包含JSON的部分
+                    for line in text.splitlines():
+                        if '"message":"Success"' in line and '"status":"success"' in line:
+                            json_start = line.find('{')
+                            if json_start != -1:
+                                json_text = line[json_start:]
+                                data = json.loads(json_text)
+                                download_urls = data.get("data", {}).get("downloadUrls")
+                                if download_urls and not result_future.done():
+                                    logger.success(f"【主要方案】拦截成功! 从JSON心跳包中提取到URL: {download_urls[0]}")
+                                    result_future.set_result(download_urls[0])
+                                    return
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass  # 忽略解析失败或结构不符的响应
+
+            # 后备策略：捕获对媒体文件的直接请求
+            if "access.vheer.com/results/" in response.url and response.url.endswith(media_suffix) and not result_future.done():
+                logger.success(f"【后备方案】拦截成功! 监听到最终媒体文件URL: {response.url}")
+                result_future.set_result(response.url)
+
+        page.on("response", lambda res: asyncio.create_task(handle_response(res)))
+        
+        logger.info("正在等待结果URL... (将持续检查，最长5分钟)")
+        try:
+            # 我们在这里等待，而不是在页面上寻找元素
+            result_url = await asyncio.wait_for(result_future, timeout=settings.API_REQUEST_TIMEOUT)
+            return result_url
+        except asyncio.TimeoutError:
+            logger.error("在指定时间内未能通过网络监听捕获到任何有效的结果URL。")
+            raise
+
+    async def generate_from_text(self, request_data: Dict[str, Any]) -> JSONResponse:
+        async def task():
+            page = await self._create_page_with_logging()
+            try:
+                prompt = request_data.get("prompt")
+                size = request_data.get("size", "1:1")
+                
+                logger.debug(">>> [START] 浏览器任务: 文生图")
+                await page.goto("https://vheer.com/app/text-to-image", wait_until="networkidle")
+                logger.debug("步骤 1/4: 页面导航完成。")
+
+                prompt_selector = 'textarea[placeholder*="Steampunk flying bicycle"]'
+                await page.wait_for_selector(prompt_selector, timeout=30000)
+                await page.fill(prompt_selector, prompt)
+                logger.debug("步骤 2/4: 提示词已填入。")
+
+                aspect_ratio_dropdown_selector = 'button#hs-dropdown-hover-event'
+                aspect_ratio_option_selector = f'div.hs-dropdown-menu div.p-1 div:has-text("{size}")'
+                await page.click(aspect_ratio_dropdown_selector)
+                await page.click(aspect_ratio_option_selector)
+                logger.debug(f"步骤 3/4: 图片比例 '{size}' 已选择。")
+
+                await page.click('button:has-text("Generate")')
+                logger.debug("步骤 4/4: 'Generate' 按钮已点击，开始监听网络以捕获结果...")
+
+                result_url = await self._wait_for_result_url(page, "https://vheer.com/app/text-to-image", (".jpg", ".png", ".webp"))
+                
+                response_data = {"created": int(time.time()), "data": [{"url": result_url}]}
+                logger.success("<<< [SUCCESS] 浏览器任务: 文生图已完成。")
+                return JSONResponse(content=response_data)
+            finally:
+                if page and not page.is_closed(): await page.close()
+        return await self._execute_in_browser(task)
+
+    async def generate_from_image(self, prompt: str, image_bytes: bytes, creative_strength: int, control_strength: int) -> JSONResponse:
+        async def task():
+            page = await self._create_page_with_logging()
+            try:
+                logger.debug(">>> [START] 浏览器任务: 图生图")
+                await page.goto("https://vheer.com/app/image-to-image", wait_until="networkidle")
+                logger.debug("步骤 1/6: 页面导航完成。")
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                    tmp_file.write(image_bytes)
+                    tmp_file_path = tmp_file.name
+                
+                await page.set_input_files('input[type="file"]', tmp_file_path)
+                logger.debug("步骤 2/6: 图片已提交上传。")
+                
+                processing_overlay_selector = 'div:has-text("Processing...")'
+                await page.wait_for_selector(processing_overlay_selector, state='hidden', timeout=60000)
+                logger.debug("步骤 3/6: 图片处理完成。")
+
+                prompt_selector = 'div:has-text("Positive prompts") >> textarea'
+                await page.wait_for_selector(prompt_selector, timeout=30000)
+                await page.fill(prompt_selector, prompt)
+                logger.debug("步骤 4/6: 提示词已填入。")
+
+                await page.evaluate(f"document.getElementById('creative-strength').value = {creative_strength}; document.getElementById('creative-strength').dispatchEvent(new Event('input', {{ 'bubbles': true }}));")
+                await page.evaluate(f"document.getElementById('control-strength').value = {control_strength}; document.getElementById('control-strength').dispatchEvent(new Event('input', {{ 'bubbles': true }}));")
+                logger.debug("步骤 5/6: 滑块值设置完成。")
+                
+                await page.click('button:has-text("Generate")')
+                logger.debug("步骤 6/6: 'Generate' 按钮已点击，开始监听网络以捕获结果...")
+
+                result_url = await self._wait_for_result_url(page, "https://vheer.com/app/image-to-image", (".jpg", ".png", ".webp"))
+
+                Path(tmp_file_path).unlink()
+                response_data = {"created": int(time.time()), "data": [{"url": result_url}]}
+                logger.success("<<< [SUCCESS] 浏览器任务: 图生图已完成。")
+                return JSONResponse(content=response_data)
+            finally:
+                if page and not page.is_closed(): await page.close()
+        return await self._execute_in_browser(task)
+
+    async def generate_video_from_image(self, image_bytes: bytes) -> JSONResponse:
+        async def task():
+            page = await self._create_page_with_logging()
+            try:
+                logger.debug(">>> [START] 浏览器任务: 图生视频")
+                await page.goto("https://vheer.com/app/image-to-video", wait_until="networkidle")
+                logger.debug("步骤 1/3: 页面导航完成。")
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                    tmp_file.write(image_bytes)
+                    tmp_file_path = tmp_file.name
+
+                await page.set_input_files('input[type="file"]', tmp_file_path)
+                logger.debug("步骤 2/3: 图片上传完成。")
+
+                await page.click('button:has-text("Generate")')
+                logger.debug("步骤 3/3: 'Generate' 按钮已点击，开始监听网络以捕获结果...")
+
+                result_url = await self._wait_for_result_url(page, "https://vheer.com/app/image-to-video", (".mp4",))
+
+                Path(tmp_file_path).unlink()
+                response_data = {"created": int(time.time()), "data": [{"url": result_url}]}
+                logger.success("<<< [SUCCESS] 浏览器任务: 图生视频已完成。")
+                return JSONResponse(content=response_data)
+            finally:
+                if page and not page.is_closed(): await page.close()
+        return await self._execute_in_browser(task)
+
+    async def get_models(self) -> JSONResponse:
+        model_list = {
+            "object": "list",
+            "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "vheer-2api"} for name in settings.MODEL_MAPPING.keys()]
+        }
+        return JSONResponse(content=model_list)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+--- 文件路径: static\index.html ---
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vheer-2API 测试面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Vheer-2API 测试面板</h1>
+        <div class="api-key-container">
+            <label for="api-key">API Key:</label>
+            <input type="password" id="api-key" value="1">
+        </div>
+
+        <div class="tabs">
+            <button class="tab-link active" onclick="openTab(event, 't2i')">文生图</button>
+            <button class="tab-link" onclick="openTab(event, 'i2i')">图生图</button>
+            <button class="tab-link" onclick="openTab(event, 'i2v')">图生视频</button>
+        </div>
+
+        <!-- 文生图 Tab -->
+        <div id="t2i" class="tab-content active">
+            <h2>文生图 (Text-to-Image)</h2>
+            <form id="t2i-form">
+                <div class="form-group">
+                    <label for="t2i-prompt">提示词 (Prompt)</label>
+                    <textarea id="t2i-prompt" required placeholder="例如：一只穿着宇航服的猫在月球上"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="t2i-model">模型 (Model)</label>
+                    <select id="t2i-model">
+                        <option value="vheer-text-to-image-pro" selected>Pro Model</option>
+                        <option value="vheer-text-to-image-max">Max Model</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="t2i-size">比例 (Aspect Ratio)</label>
+                    <select id="t2i-size">
+                        <option value="1:1" selected>1:1 (方形)</option>
+                        <option value="1:2">1:2</option>
+                        <option value="2:1">2:1</option>
+                        <option value="2:3">2:3</option>
+                        <option value="3:2">3:2</option>
+                        <option value="3:4">3:4</option>
+                        <option value="4:3">4:3</option>
+                        <option value="4:5">4:5</option>
+                        <option value="5:4">5:4</option>
+                        <option value="9:16">9:16 (竖屏)</option>
+                        <option value="16:9">16:9 (横屏)</option>
+                    </select>
+                </div>
+                <button type="submit">生成图像</button>
+            </form>
+        </div>
+
+        <!-- 图生图 Tab -->
+        <div id="i2i" class="tab-content">
+            <h2>图生图 (Image-to-Image)</h2>
+            <form id="i2i-form">
+                <div class="form-group">
+                    <label for="i2i-image">上传图片</label>
+                    <input type="file" id="i2i-image" accept="image/*" required>
+                </div>
+                <div class="form-group">
+                    <label for="i2i-prompt">提示词 (Prompt)</label>
+                    <textarea id="i2i-prompt" required placeholder="描述你希望如何修改图片"></textarea>
+                </div>
+                <div class="form-group slider-group">
+                    <label for="creative-strength">创意实力 (Creative Strength): <span id="creative-value">10</span></label>
+                    <input type="range" id="creative-strength" min="1" max="10" value="10">
+                </div>
+                <div class="form-group slider-group">
+                    <label for="control-strength">控制强度 (Control Strength): <span id="control-value">2</span></label>
+                    <input type="range" id="control-strength" min="1" max="10" value="2">
+                </div>
+                <button type="submit">生成图像</button>
+            </form>
+        </div>
+
+        <!-- 图生视频 Tab -->
+        <div id="i2v" class="tab-content">
+            <h2>图生视频 (Image-to-Video)</h2>
+            <form id="i2v-form">
+                <div class="form-group">
+                    <label for="i2v-image">上传图片</label>
+                    <input type="file" id="i2v-image" accept="image/*" required>
+                </div>
+                <button type="submit">生成视频</button>
+            </form>
+        </div>
+
+        <div id="result-container" class="hidden">
+            <h3>生成结果</h3>
+            <div id="spinner" class="spinner hidden"></div>
+            <div id="result-output"></div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
+
+--- 文件路径: static\script.js ---
+
+function openTab(evt, tabName) {
+    var i, tabcontent, tablinks;
+    tabcontent = document.getElementsByClassName("tab-content");
+    for (i = 0; i < tabcontent.length; i++) {
+        tabcontent[i].style.display = "none";
+    }
+    tablinks = document.getElementsByClassName("tab-link");
+    for (i = 0; i < tablinks.length; i++) {
+        tablinks[i].className = tablinks[i].className.replace(" active", "");
+    }
+    document.getElementById(tabName).style.display = "block";
+    evt.currentTarget.className += " active";
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const apiKeyInput = document.getElementById('api-key');
+    const resultContainer = document.getElementById('result-container');
+    const resultOutput = document.getElementById('result-output');
+    const spinner = document.getElementById('spinner');
+
+    // --- Sliders ---
+    const creativeSlider = document.getElementById('creative-strength');
+    const creativeValue = document.getElementById('creative-value');
+    const controlSlider = document.getElementById('control-strength');
+    const controlValue = document.getElementById('control-value');
+
+    creativeSlider.oninput = () => creativeValue.textContent = creativeSlider.value;
+    controlSlider.oninput = () => controlValue.textContent = controlSlider.value;
+
+    // --- Form Handlers ---
+    document.getElementById('t2i-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        const payload = {
+            prompt: document.getElementById('t2i-prompt').value,
+            model: document.getElementById('t2i-model').value,
+            size: document.getElementById('t2i-size').value,
+            n: 1,
+            response_format: "url"
+        };
+        try {
+            const response = await fetch('/v1/images/generations', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKeyInput.value}`
+                },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            handleResult(result, 'image');
+        } catch (error) {
+            handleError(error);
+        } finally {
+            setLoading(false);
+        }
+    });
+
+    document.getElementById('i2i-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        const formData = new FormData();
+        formData.append('image', document.getElementById('i2i-image').files[0]);
+        formData.append('prompt', document.getElementById('i2i-prompt').value);
+        formData.append('creative_strength', creativeSlider.value);
+        formData.append('control_strength', controlSlider.value);
+
+        try {
+            const response = await fetch('/v1/images/edits', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${apiKeyInput.value}` },
+                body: formData
+            });
+            const result = await response.json();
+            handleResult(result, 'image');
+        } catch (error) {
+            handleError(error);
+        } finally {
+            setLoading(false);
+        }
+    });
+
+    document.getElementById('i2v-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        const formData = new FormData();
+        formData.append('image', document.getElementById('i2v-image').files[0]);
+
+        try {
+            const response = await fetch('/v1/video/generations', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${apiKeyInput.value}` },
+                body: formData
+            });
+            const result = await response.json();
+            handleResult(result, 'video');
+        } catch (error) {
+            handleError(error);
+        } finally {
+            setLoading(false);
+        }
+    });
+
+    // --- Helper Functions ---
+    function setLoading(isLoading) {
+        spinner.classList.toggle('hidden', !isLoading);
+        resultContainer.classList.remove('hidden');
+        if (isLoading) {
+            resultOutput.innerHTML = '';
+        }
+    }
+
+    function handleResult(result, type) {
+        if (result.detail) {
+            handleError(new Error(result.detail));
+            return;
+        }
+        const url = result.data[0].url;
+        if (type === 'image') {
+            resultOutput.innerHTML = `<img src="${url}" alt="Generated Image"><p><a href="${url}" target="_blank">${url}</a></p>`;
+        } else if (type === 'video') {
+            resultOutput.innerHTML = `<video controls src="${url}"></video><p><a href="${url}" target="_blank">${url}</a></p>`;
+        }
+    }
+
+    function handleError(error) {
+        resultOutput.innerHTML = `<div class="error">错误: ${error.message}</div>`;
+    }
+});
+
+--- 文件路径: static\style.css ---
+
+body {
+    font-family: sans-serif;
+    background-color: #f0f2f5;
+    color: #333;
+    margin: 0;
+    padding: 20px;
+    display: flex;
+    justify-content: center;
+}
+.container {
+    width: 100%;
+    max-width: 800px;
+    background-color: #fff;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+h1, h2 { text-align: center; }
+.api-key-container { margin-bottom: 20px; text-align: center; }
+.tabs { overflow: hidden; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
+.tab-link {
+    background-color: #f1f1f1;
+    float: left;
+    border: none;
+    outline: none;
+    cursor: pointer;
+    padding: 14px 16px;
+    transition: background-color 0.3s;
+    font-size: 17px;
+}
+.tab-link:hover { background-color: #ddd; }
+.tab-link.active { background-color: #ccc; }
+.tab-content { display: none; padding: 6px 12px; border-top: none; }
+.tab-content.active { display: block; }
+.form-group { margin-bottom: 15px; }
+label { display: block; margin-bottom: 5px; font-weight: bold; }
+input[type="text"], input[type="password"], textarea, select, input[type="file"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
+}
+textarea { resize: vertical; min-height: 80px; }
+button {
+    background-color: #4CAF50;
+    color: white;
+    padding: 10px 15px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    width: 100%;
+}
+button:hover { background-color: #45a049; }
+#result-container { margin-top: 20px; text-align: center; }
+#result-output img, #result-output video { max-width: 100%; border-radius: 4px; margin-top: 10px; }
+.error { color: red; font-weight: bold; }
+.hidden { display: none; }
+.spinner {
+    border: 4px solid rgba(0,0,0,0.1);
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border-left-color: #09f;
+    animation: spin 1s ease infinite;
+    margin: 20px auto;
+}
+.slider-group { display: flex; flex-direction: column; }
+.slider-group label { display: flex; justify-content: space-between; }
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+
